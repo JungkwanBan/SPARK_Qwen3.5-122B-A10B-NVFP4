@@ -19,6 +19,9 @@ services:
       # Avarok saw +13% on their build; on SM121 with native CUTLASS FP4 it may be slower.
       # Set to "1" to enable; "0" (default) keeps native CUTLASS.
       - VLLM_NVFP4_MOE_FORCE_MARLIN=0
+      # Disable FlashInfer MoE FP4 backends (FLASHINFER_CUTLASS requires FP8 activations
+      # from the profile run dummy data; use VLLM native CUTLASS MoE instead).
+      - VLLM_USE_FLASHINFER_MOE_FP4=0
 
     deploy:
       resources:
@@ -60,6 +63,7 @@ services:
       --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS}
       --load-format safetensors
       --enable-prefix-caching
+      --enforce-eager
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s

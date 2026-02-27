@@ -15,6 +15,8 @@ from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFunc,
+    MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
@@ -517,10 +519,17 @@ class Qwen3_5VLMoeLLMForCausalLM(nn.Module):
 
 class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
-        from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
-            Qwen3_5MoeConfig,
-        )
-        return self.ctx.get_hf_config(Qwen3_5MoeConfig)
+        # Nightly vLLM loads Qwen3_5MoeConfig via its own config class
+        # (vllm.transformers_utils.configs.qwen3_5_moe), not from HF transformers.
+        # Use whichever is actually loaded to avoid type mismatch in get_hf_config().
+        try:
+            from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
+            return self.ctx.get_hf_config(Qwen3_5MoeConfig)
+        except (ImportError, TypeError):
+            from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+                Qwen3_5MoeConfig,
+            )
+            return self.ctx.get_hf_config(Qwen3_5MoeConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -615,9 +624,12 @@ class Qwen3_5MoeForConditionalGeneration(
         # Skip Qwen3VLForConditionalGeneration.__init__ (wrong LM type)
         super(Qwen3VLForConditionalGeneration, self).__init__()
 
-        from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
-            Qwen3_5MoeConfig,
-        )
+        try:
+            from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
+        except ImportError:
+            from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+                Qwen3_5MoeConfig,
+            )
 
         config: Qwen3_5MoeConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -642,7 +654,6 @@ class Qwen3_5MoeForConditionalGeneration(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 quant_config=quant_config,
-                multimodal_config=multimodal_config,
                 prefix=maybe_prefix(prefix, "visual"),
             )
 
@@ -751,12 +762,19 @@ class Qwen3_5MoeForConditionalGeneration(
     # ------------------------------------------------------------------
 
     @classmethod
+    def get_mamba_state_copy_func(
+        cls,
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+    @classmethod
     def get_mamba_state_dtype_from_config(
         cls, vllm_config: "VllmConfig"
     ) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
 
     @classmethod
