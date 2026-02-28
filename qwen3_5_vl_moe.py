@@ -758,6 +758,22 @@ class Qwen3_5MoeForConditionalGeneration(
         self.set_moe_parameters()
 
     # ------------------------------------------------------------------
+    # Weight loading
+    # ------------------------------------------------------------------
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # When running in text-only mode (--language-model-only),
+        # self.visual is None.  Filter out visual encoder weights
+        # so the autoloader doesn't fail on missing 'visual' module.
+        if self.visual is None:
+            weights = (
+                (name, tensor)
+                for name, tensor in weights
+                if "visual" not in name
+            )
+        return super().load_weights(weights)
+
+    # ------------------------------------------------------------------
     # HasInnerState (Mamba / GDN recurrent state management)
     # ------------------------------------------------------------------
 
