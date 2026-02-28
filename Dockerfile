@@ -89,14 +89,15 @@ EOF
 # Fix: GDN layers use Triton FLA kernels (fused_recurrent_gated_delta_rule,
 # chunk_gated_delta_rule, fused_gdn_gating) that require a runtime Triton
 # memory allocator for scratch buffers.  vLLM only sets this in matmul_ogs.py
-# for MoE matmul; GDN linear-attention layers need it too.  Without it, eager
-# mode crashes with:
+# for MoE matmul; GDN linear-attention layers need it too.  Without it, the
+# custom op's eager execution crashes with:
 #   RuntimeError: Kernel requires a runtime memory allocation, but no allocator was set.
 #
-# Additionally, the nightly vLLM refactored Qwen3NextGatedDeltaNet.forward() to
-# use torch.ops.vllm.gdn_attention_core (a C++ custom op), but that op is NOT
-# compiled in the nightly Python wheels (requires source build with SM121 support).
-# Fix: bypass gdn_attention_core and call _forward_core() directly.
+# The nightly registers gdn_attention_core via direct_register_custom_op (Python,
+# not C++), so it works as a splitting_op for torch.compile.  We keep the original
+# torch.ops.vllm.gdn_attention_core() call intact — during tracing dynamo uses the
+# fake impl (no-op), and during eager execution the real impl calls _forward_core()
+# which now sets the Triton allocator.
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -132,31 +133,10 @@ if old_logger not in src:
 
 src = src.replace(old_logger, new_logger, 1)
 
-# 2. Bypass torch.ops.vllm.gdn_attention_core (not compiled in nightly wheels)
-#    Replace the custom op call in forward() with a direct _forward_core() call.
-old_op = (
-    '        torch.ops.vllm.gdn_attention_core(\n'
-    '            mixed_qkv,\n'
-    '            b,\n'
-    '            a,\n'
-    '            core_attn_out,\n'
-    '            self.prefix,\n'
-    '        )\n'
-)
-new_op = (
-    '        # [gdn_custom_op_bypass] gdn_attention_core not compiled in nightly wheels;\n'
-    '        # call _forward_core() directly. With --enforce-eager (no torch.compile),\n'
-    '        # triton.set_allocator inside _forward_core works without dynamo restrictions.\n'
-    '        self._forward_core(mixed_qkv, b, a, core_attn_out)\n'
-)
-
-if old_op not in src:
-    print("ERROR: gdn_attention_core call not found in qwen3_next.py", file=sys.stderr)
-    sys.exit(1)
-
-src = src.replace(old_op, new_op, 1)
-
-# 3. Call triton.set_allocator() at start of _forward_core
+# 2. Call triton.set_allocator() at start of _forward_core.
+#    The gdn_attention_core custom op is in splitting_ops, so _forward_core runs
+#    in eager mode (not compiled by dynamo).  triton.set_allocator uses ContextVar
+#    which is fine in eager mode.
 old_fcore = (
     '        """\n'
     '        Core attention computation (called by custom op).\n'
@@ -180,7 +160,7 @@ src = src.replace(old_fcore, new_fcore, 1)
 
 with open(path, "w") as f:
     f.write(src)
-print("Applied GDN Triton allocator + gdn_attention_core bypass to qwen3_next.py.")
+print("Applied GDN Triton allocator fix to qwen3_next.py (custom op kept as splitting_op).")
 PYEOF
 
 # Fix: NVFP4 CUTLASS MoE kernel occasionally produces NaN values during prefill

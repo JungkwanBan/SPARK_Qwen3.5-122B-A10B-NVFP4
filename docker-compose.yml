@@ -63,7 +63,6 @@ services:
       --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS}
       --load-format safetensors
       --enable-prefix-caching
-      --enforce-eager
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
