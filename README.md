@@ -124,24 +124,46 @@ This forces these layers to use `UnquantizedLinearMethod` (BF16), matching the a
 ## Benchmarks (2026-03-01)
 
 Hardware: NVIDIA DGX Spark (GB10, SM121), single GPU, NVFP4 W4A4
-Test: code generation (binary search), `max_tokens=512`, `temperature=0.0`
-Metric: end-to-end tok/s (thinking + content tokens, warm runs average)
+Tool: [llama-benchy](https://github.com/menloresearch/llama-benchy) v0.3.3, concurrency=1, 3 runs per config
 
-### MoE Backend: CUTLASS vs Marlin
+### llama-benchy: MTP OFF vs MTP ON
 
-| Backend | Avg tok/s | Notes |
-|---|---|---|
-| **CUTLASS W4A4** (native) | **15.2** | SM121 native FP4 tensor cores |
-| Marlin W4A16 | 15.3 | No benefit on SM121; "Not enough SMs for max_autotune_gemm" |
+#### Prefill (prompt processing, tok/s)
 
-### KV Cache: BF16 vs FP8
+| Prompt tokens | MTP OFF | MTP ON | Change |
+|---|---|---|---|
+| pp128 | 441 | 286 | -35% |
+| pp256 | 732 | 582 | -21% |
+| pp512 | 1,146 | 938 | -18% |
+| pp1024 | 1,602 | 1,401 | -13% |
 
-| KV dtype | Available KV memory | 262K concurrent capacity |
-|---|---|---|
-| BF16 (auto) | ~12 GiB | ~3.7x |
-| **FP8** | **24.59 GiB** | **7.45x** |
+#### Decode (token generation, tok/s)
 
-### MTP Speculative Decoding (5 runs each)
+| Gen tokens | MTP OFF | MTP ON | Change |
+|---|---|---|---|
+| tg128 | 15.1 | 12.7 | -16% |
+| tg256 | 15.1 | 12.6 | -17% |
+| tg512 | 15.1 | 12.6 | -17% |
+| **Peak** | **16.0** | **14.0** | -13% |
+
+#### Time to First Token (e2e_ttft, ms)
+
+| Prompt tokens | MTP OFF | MTP ON | Change |
+|---|---|---|---|
+| pp128 | 295 | 505 | +71% |
+| pp256 | 354 | 445 | +26% |
+| pp512 | 450 | 550 | +22% |
+| pp1024 | 643 | 735 | +14% |
+
+> **Note:** llama-benchy measures raw prefill/decode throughput without reasoning tokens.
+> MTP adds overhead per step (draft model forward pass) that is not recouped at concurrency=1
+> with short, non-reasoning completions. The benefit of MTP appears in end-to-end inference
+> with reasoning/thinking mode where the speculative tokens offset the draft overhead.
+
+### End-to-End Chat Completions (reasoning mode)
+
+Test: code generation (binary search), `max_tokens=512`, `temperature=0.0`, 5 warm runs
+Metric: total completion_tokens (thinking + content) / wall time
 
 | | MTP OFF (tok/s) | MTP ON (tok/s) | Change |
 |---|---|---|---|
@@ -155,6 +177,22 @@ Metric: end-to-end tok/s (thinking + content tokens, warm runs average)
 > \*Run 1 is cold start (torch.compile + CUDA graph first capture).
 > MTP weights (785 keys, 4.7 GB BF16) extracted from original [Qwen/Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) and merged into the NVFP4 checkpoint.
 
+### Other A/B Tests
+
+#### MoE Backend: CUTLASS vs Marlin
+
+| Backend | Avg tok/s | Notes |
+|---|---|---|
+| **CUTLASS W4A4** (native) | **15.2** | SM121 native FP4 tensor cores |
+| Marlin W4A16 | 15.3 | No benefit on SM121; "Not enough SMs for max_autotune_gemm" |
+
+#### KV Cache: BF16 vs FP8
+
+| KV dtype | Available KV memory | 262K concurrent capacity |
+|---|---|---|
+| BF16 (auto) | ~12 GiB | ~3.7x |
+| **FP8** | **24.59 GiB** | **7.45x** |
+
 ### Final Configuration
 
 | Setting | Value |
@@ -164,7 +202,7 @@ Metric: end-to-end tok/s (thinking + content tokens, warm runs average)
 | MTP spec decode | Enabled (`num_speculative_tokens=1`) |
 | Chunked prefill | Enabled |
 | torch.compile | Enabled (CUDA graph) |
-| **Throughput** | **24.5 tok/s** |
+| **Throughput (reasoning)** | **24.5 tok/s** |
 | 262K concurrent | 5.58x |
 
 ---
