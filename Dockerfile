@@ -170,8 +170,10 @@ PYEOF
 # output token.
 #
 # Fix: add a torch.nan_to_num guard on the MoE FFN output inside
-# Qwen3NextDecoderLayer.forward().  The guard is unconditional (no data-dependent
-# branch) so it is fully compatible with torch.compile / dynamo.
+# Qwen3NextDecoderLayer.forward(), but ONLY for linear_attention (GDN) layers.
+# full_attention layers (12/48) skip the guard entirely.
+# self.layer_type is a construction-time constant already branched on in
+# forward(), so torch.compile / dynamo handles it correctly (graph specialization).
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -194,9 +196,10 @@ new_mlp = (
     '\n'
     '        ' + MARKER + '\n'
     '        # NVFP4 CUTLASS MoE kernel can produce NaN during prefill with\n'
-    '        # GDN-derived activations.  Replace unconditionally (no data-dependent\n'
-    '        # branch) so this is fully compatible with torch.compile / dynamo.\n'
-    '        hidden_states = hidden_states.nan_to_num(nan=0.0)\n'
+    '        # GDN-derived activations.  Only guard linear_attention (GDN) layers;\n'
+    '        # full_attention layers are unaffected and skip the overhead.\n'
+    '        if self.layer_type == "linear_attention":\n'
+    '            hidden_states = hidden_states.nan_to_num(nan=0.0)\n'
     '\n'
     '        if self.layer_scale:'
 )
@@ -209,7 +212,7 @@ src = src.replace(old_mlp, new_mlp, 1)
 
 with open(path, "w") as f:
     f.write(src)
-print("Applied NaN guard to Qwen3NextDecoderLayer.forward() in qwen3_next.py.")
+print("Applied NaN guard (GDN layers only) to Qwen3NextDecoderLayer.forward() in qwen3_next.py.")
 PYEOF
 
 # Fix: Qwen3NextMTP.remap_weight_names() — strip "language_model." prefix from VL model weights
@@ -359,6 +362,56 @@ src = src.replace(old, new, 1)
 with open(path, "w") as f:
     f.write(src)
 print("Patched qwen3_next_mtp.py: MTP layers excluded from NVFP4 quantization (BF16 path).")
+PYEOF
+
+# Fix: Same quant exclusion fix for qwen3_5_mtp.py (Qwen3_5MoeMTP class).
+# The nightly vLLM routes Qwen3.5-MoE MTP through qwen3_5_mtp.py, not qwen3_next_mtp.py.
+# Without this, BF16 MTP weights hit NVFP4 ColumnParallelLinear → shape mismatch → AssertionError.
+RUN python3 - <<'PYEOF'
+import sys
+
+path = "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_5_mtp.py"
+with open(path) as f:
+    src = f.read()
+
+MARKER = "# [mtp_quant_exclusion_fix_qwen35]"
+if MARKER in src:
+    print("qwen3_5_mtp.py: MTP quant exclusion fix already applied, skipping.")
+    sys.exit(0)
+
+old = (
+    "        model_config = vllm_config.model_config\n"
+    "        quant_config = vllm_config.quant_config\n"
+    "\n"
+    "        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = model_config.hf_text_config\n"
+)
+new = (
+    "        model_config = vllm_config.model_config\n"
+    "        quant_config = vllm_config.quant_config\n"
+    "\n"
+    "        " + MARKER + "\n"
+    "        # MTP checkpoint weights are plain BF16 (no pre-quantized NVFP4 tensors).\n"
+    "        # Exclude all mtp.* layers from NVFP4 quantization so they run in BF16.\n"
+    "        # This must happen BEFORE any sub-layer is constructed so that\n"
+    "        # get_quant_method() sees the updated exclude_modules list.\n"
+    "        if quant_config is not None and hasattr(quant_config, 'exclude_modules'):\n"
+    "            if 'mtp.' not in quant_config.exclude_modules:\n"
+    "                quant_config.exclude_modules.append('mtp.')\n"
+    "                logger.info(\n"
+    "                    'MTP: added mtp. to quant_config.exclude_modules '\n"
+    "                    '→ all MTP sub-layers will use unquantized BF16.')\n"
+    "\n"
+    "        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = model_config.hf_text_config\n"
+)
+
+if old not in src:
+    print("ERROR: anchor not found in qwen3_5_mtp.py", file=sys.stderr)
+    sys.exit(1)
+
+src = src.replace(old, new, 1)
+with open(path, "w") as f:
+    f.write(src)
+print("Patched qwen3_5_mtp.py: MTP layers excluded from NVFP4 quantization (BF16 path).")
 PYEOF
 
 # Fix: MRotaryEmbedding.forward_native() — narrow 2D positions to query.shape[0]
@@ -511,4 +564,218 @@ src = src.replace(old, new, 1)
 with open(path, "w") as f:
     f.write(src)
 print("Patched spec_decode/metrics.py: negative counter guard added to SpecDecodingProm.observe().")
+PYEOF
+
+# Fix: flashinfer autotuner re-profiles all GEMM tactics on every startup because
+# profiling_cache is in-memory only.  On SM12x, the TRT-LLM CUTLASS tactic fails
+# 1,500+ times per startup (Ninja build failure for delayStream.cu).
+#
+# Two-part fix:
+# 1. Patch autotuner.py: redirect get_config_path to the flashinfer cache volume
+#    (/root/.cache/flashinfer/tuning_configs/) so results survive container recreation.
+#    Patch load_from_file to use exec() for file-based loading (no importlib needed).
+# 2. Patch kernel_warmup.py: dump profiling_cache after autotuning completes.
+#    With FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1, subsequent starts load from file.
+
+# Part 1: Patch autotuner.py — config path + file loader
+RUN python3 - <<'PYEOF'
+import sys
+
+path = "/usr/local/lib/python3.12/dist-packages/flashinfer/autotuner.py"
+with open(path) as f:
+    src = f.read()
+
+MARKER = "# [gb10_config_path_fix]"
+if MARKER in src:
+    print("autotuner.py: config path fix already applied, skipping.")
+    sys.exit(0)
+
+# 1a. Patch get_config_path to use cache volume
+old_gcp = (
+    'def get_config_path(is_module: bool):\n'
+    '    dev_name = torch.cuda.get_device_name(0).replace(" ", "_")\n'
+    '    cutlass_ver = _nvfp4_cutlass_version.replace(".", "_")\n'
+    '    config_name = f"v{cutlass_ver}_trtllm_fused_moe_{dev_name}"\n'
+    '    if is_module:\n'
+    '        return f"flashinfer.tuning_configs.{config_name}"\n'
+    '    else:\n'
+    '        return os.path.join(\n'
+    '            os.path.dirname(os.path.realpath(__file__)),\n'
+    '            "tuning_configs",\n'
+    '            config_name + ".py",\n'
+    '        )'
+)
+new_gcp = (
+    MARKER + '\n'
+    'def get_config_path(is_module: bool):\n'
+    '    dev_name = torch.cuda.get_device_name(0).replace(" ", "_")\n'
+    '    cutlass_ver = _nvfp4_cutlass_version.replace(".", "_")\n'
+    '    config_name = f"v{cutlass_ver}_trtllm_fused_moe_{dev_name}"\n'
+    '    # Always return file path (cache volume); is_module ignored.\n'
+    '    cache_dir = os.path.join(\n'
+    '        os.environ.get("FLASHINFER_CACHE_DIR",\n'
+    '                        os.path.expanduser("~/.cache/flashinfer")),\n'
+    '        "tuning_configs",\n'
+    '    )\n'
+    '    return os.path.join(cache_dir, config_name + ".py")'
+)
+
+if old_gcp not in src:
+    print("ERROR: get_config_path anchor not found in autotuner.py", file=sys.stderr)
+    sys.exit(1)
+
+src = src.replace(old_gcp, new_gcp, 1)
+
+# 1b. Patch load_from_file to use exec() instead of importlib.import_module
+old_lff = (
+    '@lru_cache(maxsize=None)\n'
+    'def load_from_file(key):\n'
+    '    module_name = get_config_path(is_module=True)\n'
+    '    try:\n'
+    '        module = importlib.import_module(module_name)\n'
+    '        best_configs = module.best_configs\n'
+    '    except (ImportError, AttributeError):\n'
+    '        best_configs = None\n'
+    '    if best_configs is not None:\n'
+    '        k = str((key[0], key[1], key[3]))\n'
+    '        if k in best_configs:\n'
+    '            logger.info(f"[Autotuner]: Loading configs for {k} from file.")\n'
+    '            return True, best_configs[k][0], best_configs[k][1], None\n'
+    '    logger.info(\n'
+    '        f"[Autotuner]: Loading configs for {key} from file failed; Using default configs instead."\n'
+    '    )\n'
+    '    return False, 0, -1, None'
+)
+new_lff = (
+    '@lru_cache(maxsize=None)\n'
+    'def load_from_file(key):\n'
+    '    config_file = get_config_path(is_module=False)\n'
+    '    best_configs = None\n'
+    '    if os.path.isfile(config_file):\n'
+    '        try:\n'
+    '            ns = {}\n'
+    '            with open(config_file) as f:\n'
+    '                exec(f.read(), ns)\n'
+    '            best_configs = ns.get("best_configs")\n'
+    '        except Exception:\n'
+    '            best_configs = None\n'
+    '    if best_configs is not None:\n'
+    '        k = str((key[0], key[1], key[3]))\n'
+    '        if k in best_configs:\n'
+    '            logger.info(f"[Autotuner]: Loading configs for {k} from {config_file}.")\n'
+    '            return True, best_configs[k][0], best_configs[k][1], None\n'
+    '    logger.info(\n'
+    '        f"[Autotuner]: Loading configs for {key} from file failed; Using default configs instead."\n'
+    '    )\n'
+    '    return False, 0, -1, None'
+)
+
+if old_lff not in src:
+    print("ERROR: load_from_file anchor not found in autotuner.py", file=sys.stderr)
+    sys.exit(1)
+
+src = src.replace(old_lff, new_lff, 1)
+
+with open(path, "w") as f:
+    f.write(src)
+print("Patched autotuner.py: config path → cache volume, load_from_file → exec()-based.")
+PYEOF
+
+# Part 2: Patch kernel_warmup.py — dump profiling_cache after autotune
+RUN python3 - <<'PYEOF'
+import sys
+
+path = "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py"
+with open(path) as f:
+    src = f.read()
+
+MARKER = "# [flashinfer_autotune_cache_dump]"
+if MARKER in src:
+    print("kernel_warmup.py: autotune cache dump already applied, skipping.")
+    sys.exit(0)
+
+old = (
+    'def flashinfer_autotune(runner: "GPUModelRunner") -> None:\n'
+    '    """\n'
+    '    Autotune FlashInfer operations.\n'
+    '    FlashInfer have many implementations for the same operation,\n'
+    '    autotuning runs benchmarks for each implementation and stores\n'
+    '    the results. The results are cached transparently and\n'
+    '    future calls to FlashInfer will use the best implementation.\n'
+    '    Without autotuning, FlashInfer will rely on heuristics, which may\n'
+    '    be significantly slower.\n'
+    '    """\n'
+    '    from vllm.utils.flashinfer import autotune\n'
+    '\n'
+    '    with torch.inference_mode(), autotune():\n'
+    '        # We skip EPLB here since we don\'t want to record dummy metrics\n'
+    '        # When autotuning with number of tokens m, flashinfer will autotune\n'
+    '        # operations for all number of tokens up to m.\n'
+    '        # So we only need to run with the max number of tokens.\n'
+    '        runner._dummy_run(\n'
+    '            runner.scheduler_config.max_num_batched_tokens,\n'
+    '            skip_eplb=True,\n'
+    '            is_profile=True,\n'
+    '        )'
+)
+new = (
+    'def flashinfer_autotune(runner: "GPUModelRunner") -> None:\n'
+    '    """\n'
+    '    Autotune FlashInfer operations.\n'
+    '    FlashInfer have many implementations for the same operation,\n'
+    '    autotuning runs benchmarks for each implementation and stores\n'
+    '    the results. The results are cached transparently and\n'
+    '    future calls to FlashInfer will use the best implementation.\n'
+    '    Without autotuning, FlashInfer will rely on heuristics, which may\n'
+    '    be significantly slower.\n'
+    '    """\n'
+    '    from vllm.utils.flashinfer import autotune\n'
+    '\n'
+    '    with torch.inference_mode(), autotune():\n'
+    '        # We skip EPLB here since we don\'t want to record dummy metrics\n'
+    '        # When autotuning with number of tokens m, flashinfer will autotune\n'
+    '        # operations for all number of tokens up to m.\n'
+    '        # So we only need to run with the max number of tokens.\n'
+    '        runner._dummy_run(\n'
+    '            runner.scheduler_config.max_num_batched_tokens,\n'
+    '            skip_eplb=True,\n'
+    '            is_profile=True,\n'
+    '        )\n'
+    '\n'
+    '    ' + MARKER + '\n'
+    '    # Dump profiling_cache to flashinfer tuning_configs so subsequent starts\n'
+    '    # can load via FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1 and skip re-profiling.\n'
+    '    try:\n'
+    '        from flashinfer.autotuner import AutoTuner, get_config_path\n'
+    '        cache = AutoTuner.get().profiling_cache\n'
+    '        if cache:\n'
+    '            config_path = get_config_path(is_module=False)\n'
+    '            import os\n'
+    '            os.makedirs(os.path.dirname(config_path), exist_ok=True)\n'
+    '            lines = ["best_configs = {"]\n'
+    '            for key, (runner_id, tactic, _profile) in sorted(cache.items(), key=str):\n'
+    '                k = str((key[0], key[1], key[3]))\n'
+    '                lines.append(f"    {k!r}: ({runner_id}, {tactic}),")\n'
+    '            lines.append("}")\n'
+    '            with open(config_path, "w") as f:\n'
+    '                f.write("\\n".join(lines) + "\\n")\n'
+    '            logger.info(\n'
+    '                "flashinfer autotune: saved %d entries to %s",\n'
+    '                len(cache), config_path,\n'
+    '            )\n'
+    '            # Enable file-based loading for this process too\n'
+    '            os.environ["FLASHINFER_AUTOTUNER_LOAD_FROM_FILE"] = "1"\n'
+    '    except Exception as e:\n'
+    '        logger.warning("flashinfer autotune cache dump failed: %s", e)'
+)
+
+if old not in src:
+    print("ERROR: flashinfer_autotune anchor not found in kernel_warmup.py", file=sys.stderr)
+    sys.exit(1)
+
+src = src.replace(old, new, 1)
+
+with open(path, "w") as f:
+    f.write(src)
+print("Patched kernel_warmup.py: autotune results dump to cache volume after warmup.")
 PYEOF

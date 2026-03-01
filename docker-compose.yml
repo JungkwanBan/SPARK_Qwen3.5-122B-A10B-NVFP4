@@ -19,10 +19,11 @@ services:
       # Avarok saw +13% on their build; on SM121 with native CUTLASS FP4 it may be slower.
       # Set to "1" to enable; "0" (default) keeps native CUTLASS.
       - VLLM_NVFP4_MOE_FORCE_MARLIN=0
+      # A/B tested: Marlin W4A16 ≈ CUTLASS W4A4 on SM121 122B (~15.2 tok/s both).
+      # No benefit from Marlin; keep native CUTLASS for stability.
       # Disable FlashInfer MoE FP4 backends (FLASHINFER_CUTLASS requires FP8 activations
       # from the profile run dummy data; use VLLM native CUTLASS MoE instead).
       - VLLM_USE_FLASHINFER_MOE_FP4=0
-
     deploy:
       resources:
         reservations:
@@ -41,10 +42,10 @@ services:
       memlock:
         soft: -1
         hard: -1
-    # MTP speculative decoding is disabled: the NVFP4 checkpoint has no mtp.* weights
-    # (stripped during quantization). To enable once BF16 MTP weights are sourced, add:
-    #   --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
-    # The Dockerfile already contains the mtp_quant_exclusion_fix patch for BF16 inference.
+    # MTP speculative decoding: ENABLED (BF16 mtp.* weights extracted from original
+    # Qwen/Qwen3.5-122B-A10B and merged into NVFP4 checkpoint on Mar 1 2026).
+    # Dockerfile mtp_quant_exclusion_fix ensures MTP layers run in BF16 (not NVFP4).
+    # --no-enable-chunked-prefill: required for MTP compatibility.
     command: >
       vllm serve /models/vLLM_txn545_Qwen3.5-122B-A10B-NVFP4
       --served-model-name vLLM_txn545_Qwen3.5-122B-A10B-NVFP4
@@ -57,14 +58,15 @@ services:
       --host 0.0.0.0
       --port 8000
       --dtype auto
-      --kv-cache-dtype auto
+      --kv-cache-dtype fp8
       --attention-backend flashinfer
       --enable-chunked-prefill
       --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS}
       --load-format safetensors
       --enable-prefix-caching
       --reasoning-parser qwen3
-      --language-model-only
+      --no-enable-flashinfer-autotune
+      --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
