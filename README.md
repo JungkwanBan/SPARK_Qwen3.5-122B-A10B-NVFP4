@@ -18,6 +18,11 @@ This image extends `vllm-mxfp4-spark:latest` — a SM121-optimised vLLM build wi
 | Experts | 256 experts, top-8, 1 shared expert per layer |
 | Max context | 262 144 tokens |
 | KV cache | FP8 |
+| MTP weights | Extracted from [Qwen/Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) (BF16, 785 keys, 4.7 GB) |
+
+> **Note on MTP weights:** The NVFP4 quantized checkpoint (`txn545/Qwen3.5-122B-A10B-NVFP4`) does not include `mtp.*` weights — they are stripped during quantization. To enable MTP speculative decoding, BF16 MTP weights were extracted from the original [Qwen/Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) and saved as `mtp_weights.safetensors` in the NVFP4 checkpoint directory. A Dockerfile patch (`mtp_quant_exclusion_fix`) ensures these layers remain in BF16 rather than being incorrectly processed through the NVFP4 path.
+>
+> [Sehyo/Qwen3.5-122B-A10B-NVFP4](https://huggingface.co/Sehyo/Qwen3.5-122B-A10B-NVFP4) added MTP weights to their checkpoint as of 2026-03-02, but this has not been tested with the setup in this repository.
 
 ---
 

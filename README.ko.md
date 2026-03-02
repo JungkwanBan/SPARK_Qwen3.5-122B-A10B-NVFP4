@@ -18,6 +18,11 @@
 | 전문가 수 | 256 experts, top-8, 레이어당 공유 전문가 1개 |
 | 최대 컨텍스트 | 262,144 토큰 |
 | KV 캐시 | FP8 |
+| MTP 가중치 | [Qwen/Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B)에서 추출 (BF16, 785 keys, 4.7 GB) |
+
+> **MTP 가중치 참고:** NVFP4 양자화 체크포인트(`txn545/Qwen3.5-122B-A10B-NVFP4`)에는 `mtp.*` 가중치가 포함되어 있지 않습니다 — 양자화 과정에서 제거됩니다. MTP 추측 디코딩을 활성화하기 위해 원본 [Qwen/Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B)에서 BF16 MTP 가중치를 추출하여 NVFP4 체크포인트 디렉토리에 `mtp_weights.safetensors`로 저장했습니다. Dockerfile 패치(`mtp_quant_exclusion_fix`)가 해당 레이어를 NVFP4 경로가 아닌 BF16으로 유지합니다.
+>
+> [Sehyo/Qwen3.5-122B-A10B-NVFP4](https://huggingface.co/Sehyo/Qwen3.5-122B-A10B-NVFP4)는 2026-03-02부로 MTP 가중치를 체크포인트에 추가했으나, 본 리포지토리의 구성에서는 테스트되지 않았습니다.
 
 ---
 
