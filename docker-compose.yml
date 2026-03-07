@@ -1,7 +1,7 @@
 services:
   vllm:
     build: .
-    image: vllm-mxfp4-spark:txn545-qwen3.5-122b-nvfp4
+    image: vllm-spark:qwen3.5-nvfp4
     container_name: vllm-txn545-qwen3.5-122b-nvfp4
     environment:
       - NVIDIA_VISIBLE_DEVICES=all

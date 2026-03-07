@@ -1,60 +1,215 @@
-# =========================================================
-# vLLM for Qwen3.5-122B-A10B-NVFP4 (DGX Spark / SM121)
-# Quantized model: txn545/Qwen3.5-122B-A10B-NVFP4
+# syntax=docker/dockerfile:1.6
 #
-# Base: vllm-mxfp4-spark:latest
-#   - SM121/GB10 최적화 flashinfer-cutlass + NVFP4 지원
-#   - 최신 nightly 베이스 이미지 빌드:
-#     cd ../spark-vllm-docker && ./build-and-copy.sh --exp-mxfp4 --rebuild-vllm -t vllm-mxfp4-spark:latest
-# =========================================================
-FROM vllm-mxfp4-spark:latest
+# vLLM + Qwen3.5-122B-A10B-NVFP4 on NVIDIA DGX Spark (GB10, SM121)
+#
+# Self-contained multi-stage build:
+#   1. flashinfer-builder : Compile FlashInfer from upstream for SM121
+#   2. runner             : Minimal runtime with vLLM nightly + NVFP4 patches
+#
+# Usage:
+#   docker buildx build -t vllm-spark:qwen3.5-nvfp4 --load .
+#
+# Build args (override with --build-arg):
+#   VLLM_VERSION        - vLLM nightly wheel specifier
+#   FLASHINFER_REF      - FlashInfer git ref (branch/tag/SHA)
+#   CUTLASS_REF         - CUTLASS git ref
+#   TRANSFORMERS_VER    - transformers version for Qwen3.5 MoE
+#   BUILD_JOBS          - parallel build jobs (default: 16)
+# =========================================================================
 
-# Qwen3.5 VL MoE 모델 지원을 위한 transformers 버전 고정
-RUN uv pip install transformers==5.2.0 --upgrade --no-deps --system
-RUN uv pip install huggingface-hub --upgrade --no-deps --system
+ARG BUILD_JOBS=16
 
-# Upgrade vLLM to latest nightly (cu130 wheels, compatible with cu131 runtime, aarch64)
-# --no-deps: keep base image's torch/flashinfer/CUDA libs (SM121-specific builds)
-# gdn_attention_core custom op is NOT in these wheels; bypassed via patch below.
-# NOTE: nightly 버전은 주기적으로 purge됨. 빌드 실패 시 최신 버전으로 업데이트:
-#   pip install --dry-run --no-deps vllm --index-url https://wheels.vllm.ai/nightly/cu130
-RUN pip install 'vllm==0.16.1rc1.dev75+ge3691988d.cu130' \
-    --index-url https://wheels.vllm.ai/nightly/cu130 \
-    --no-deps --quiet
+# =========================================================================
+# STAGE 1: FlashInfer Builder
+# =========================================================================
+FROM nvcr.io/nvidia/pytorch:26.01-py3 AS flashinfer-builder
 
-# Fix: vLLM nightly qwen3_5_moe config passes ignore_keys_at_rope_validation as list,
-# but transformers 5.2.0 expects a set (uses | operator for union).
-# Convert list to set literal to fix: TypeError: unsupported operand type(s) for |: 'list' and 'set'
-RUN python3 - <<'EOF'
-path = "/usr/local/lib/python3.12/dist-packages/vllm/transformers_utils/configs/qwen3_5_moe.py"
-with open(path) as f:
-    src = f.read()
-old = (
-    '        kwargs["ignore_keys_at_rope_validation"] = [\n'
-    '            "mrope_section",\n'
-    '            "mrope_interleaved",\n'
-    '        ]\n'
-)
-new = (
-    '        kwargs["ignore_keys_at_rope_validation"] = {\n'
-    '            "mrope_section",\n'
-    '            "mrope_interleaved",\n'
-    '        }\n'
-)
-if old not in src:
-    print("ignore_keys already a set or anchor not found, skipping.")
-else:
-    src = src.replace(old, new, 1)
-    with open(path, "w") as f:
-        f.write(src)
-    print("Fixed: ignore_keys_at_rope_validation list -> set in qwen3_5_moe.py")
-EOF
+ARG BUILD_JOBS
+ENV MAX_JOBS=${BUILD_JOBS}
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
+ENV NINJAFLAGS="-j${BUILD_JOBS}"
+ENV MAKEFLAGS="-j${BUILD_JOBS}"
 
-# Qwen3.5 VL MoE 네이티브 vLLM 모델 클래스 추가
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV UV_CACHE_DIR=/root/.cache/uv
+ENV UV_SYSTEM_PYTHON=1
+ENV UV_BREAK_SYSTEM_PACKAGES=1
+ENV UV_LINK_MODE=copy
+
+# SM121 = NVIDIA Blackwell (GB10 / DGX Spark)
+ARG TORCH_CUDA_ARCH_LIST="12.1a"
+ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
+
+# Build tools
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl vim ninja-build git ccache && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install uv && pip uninstall -y flash-attn
+
+ENV PATH=/usr/lib/ccache:$PATH
+ENV CCACHE_DIR=/root/.ccache
+ENV CCACHE_MAXSIZE=50G
+ENV CCACHE_COMPRESS=1
+ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+# FlashInfer build dependencies
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
+
+# ---- Clone FlashInfer (upstream) ----
+ARG FLASHINFER_REF=main
+ARG FLASHINFER_REPO=https://github.com/flashinfer-ai/flashinfer.git
+
+RUN --mount=type=cache,id=git-flashinfer,target=/git-cache/flashinfer \
+    if [ -d /git-cache/flashinfer/.git ]; then \
+        cp -a /git-cache/flashinfer /workspace/flashinfer && \
+        cd /workspace/flashinfer && \
+        git fetch origin && git fetch origin --tags; \
+    else \
+        git clone ${FLASHINFER_REPO} /workspace/flashinfer && \
+        cp -a /workspace/flashinfer /git-cache/flashinfer; \
+    fi && \
+    cd /workspace/flashinfer && \
+    (git checkout --detach origin/${FLASHINFER_REF} 2>/dev/null || git checkout ${FLASHINFER_REF})
+
+RUN cd /workspace/flashinfer && \
+    git submodule update --init 3rdparty/spdlog
+
+# ---- Clone CUTLASS (upstream) ----
+ARG CUTLASS_REF=main
+ARG CUTLASS_REPO=https://github.com/NVIDIA/cutlass.git
+
+RUN --mount=type=cache,id=git-cutlass,target=/git-cache/cutlass \
+    cd /workspace/flashinfer && \
+    rm -rf 3rdparty/cutlass && \
+    if [ -d /git-cache/cutlass/.git ]; then \
+        cp -a /git-cache/cutlass 3rdparty/cutlass && \
+        cd 3rdparty/cutlass && \
+        git fetch origin && git fetch origin --tags; \
+    else \
+        git clone ${CUTLASS_REPO} 3rdparty/cutlass && \
+        cp -a 3rdparty/cutlass/. /git-cache/cutlass/; \
+    fi && \
+    cd /workspace/flashinfer/3rdparty/cutlass && \
+    (git checkout --detach origin/${CUTLASS_REF} 2>/dev/null || git checkout ${CUTLASS_REF})
+
+# ---- Optional: FlashInfer cubin cache patch ----
+COPY patches/flashinfer_cache.patch /workspace/flashinfer/
+RUN cd /workspace/flashinfer && \
+    (patch -p1 --dry-run < flashinfer_cache.patch &>/dev/null && \
+     patch -p1 < flashinfer_cache.patch || \
+     echo "FlashInfer cache patch not applicable, skipping.")
+
+# ---- Build FlashInfer wheels ----
+WORKDIR /workspace/flashinfer
+
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    --mount=type=cache,id=ccache,target=/root/.ccache \
+    sed -i -e 's/license = "Apache-2.0"/license = { text = "Apache-2.0" }/' \
+           -e '/license-files/d' pyproject.toml && \
+    uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v
+
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    --mount=type=cache,id=ccache,target=/root/.ccache \
+    cd flashinfer-cubin && \
+    uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v
+
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    --mount=type=cache,id=ccache,target=/root/.ccache \
+    cd flashinfer-jit-cache && \
+    uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v
+
+
+# =========================================================================
+# STAGE 2: Runner
+# =========================================================================
+FROM nvcr.io/nvidia/pytorch:26.01-py3 AS runner
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV UV_CACHE_DIR=/root/.cache/uv
+ENV UV_SYSTEM_PYTHON=1
+ENV UV_BREAK_SYSTEM_PACKAGES=1
+ENV UV_LINK_MODE=copy
+ENV VLLM_BASE_DIR=/workspace/vllm
+
+ARG TORCH_CUDA_ARCH_LIST="12.1a"
+ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
+ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+
+# Minimal runtime packages
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl vim git libxcb1 && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install uv && pip uninstall -y flash-attn
+
+WORKDIR ${VLLM_BASE_DIR}
+
+# Tiktoken encodings (offline)
+RUN mkdir -p tiktoken_encodings && \
+    wget -O tiktoken_encodings/o200k_base.tiktoken \
+      "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken" && \
+    wget -O tiktoken_encodings/cl100k_base.tiktoken \
+      "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+ENV TIKTOKEN_ENCODINGS_BASE=${VLLM_BASE_DIR}/tiktoken_encodings
+
+# ---- Install FlashInfer wheels from builder stage ----
+RUN --mount=type=bind,from=flashinfer-builder,source=/workspace/wheels,target=/mount/wheels \
+    --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    uv pip install /mount/wheels/*.whl
+
+# ---- Install vLLM nightly (cu130 / aarch64) ----
+ARG VLLM_VERSION="vllm==0.16.1rc1.dev75+ge3691988d.cu130"
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    pip install "${VLLM_VERSION}" \
+      --index-url https://wheels.vllm.ai/nightly/cu130 \
+      --no-deps --quiet || \
+    pip install vllm \
+      --index-url https://wheels.vllm.ai/nightly/cu130 \
+      --quiet
+
+# ---- Runtime dependencies ----
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    uv pip install \
+      ray[default] \
+      fastsafetensors \
+      nvidia-nvshmem-cu13
+
+# ---- Qwen3.5 MoE compatibility ----
+ARG TRANSFORMERS_VER=5.2.0
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    uv pip install transformers==${TRANSFORMERS_VER} --upgrade --no-deps --system && \
+    uv pip install huggingface-hub --upgrade --no-deps --system
+
+# ---- Patches ----
+
+# 1. fastsafetensors natural-sort patch for multi-node weight loading
+COPY patches/fastsafetensors_natural_sort.patch /tmp/
+RUN cd / && \
+    (patch -p1 --dry-run < /tmp/fastsafetensors_natural_sort.patch &>/dev/null && \
+     patch -p1 < /tmp/fastsafetensors_natural_sort.patch && \
+     echo "Applied fastsafetensors natural-sort patch." || \
+     echo "Patch not applicable (may already be fixed upstream), skipping.")
+
+# 2. Qwen3.5 MoE rope validation fix (transformers 5.x uses | operator on sets)
+COPY patches/qwen3_5_moe_rope_fix.py /tmp/
+RUN python3 /tmp/qwen3_5_moe_rope_fix.py
+
+# Remove incompatible triton-kernels if present
+RUN uv pip uninstall triton-kernels 2>/dev/null || true
+
+# ---- NVFP4-specific patches ----
+
+# 3. Qwen3.5 VL MoE custom model class (GDN in_proj quant exclusion)
 COPY qwen3_5_vl_moe.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_5_vl_moe.py
 
-# Override the nightly registry entry for Qwen3_5MoeForConditionalGeneration
-# to point to our custom model class (needed for GDN Triton FLA support)
+# 4. Override vLLM registry: Qwen3_5MoeForConditionalGeneration -> qwen3_5_vl_moe
 RUN python3 - <<'EOF'
 import sys
 
@@ -87,18 +242,7 @@ else:
     print("registry.py: Qwen3_5MoeForConditionalGeneration redirected to qwen3_5_vl_moe.")
 EOF
 
-# Fix: GDN layers use Triton FLA kernels (fused_recurrent_gated_delta_rule,
-# chunk_gated_delta_rule, fused_gdn_gating) that require a runtime Triton
-# memory allocator for scratch buffers.  vLLM only sets this in matmul_ogs.py
-# for MoE matmul; GDN linear-attention layers need it too.  Without it, the
-# custom op's eager execution crashes with:
-#   RuntimeError: Kernel requires a runtime memory allocation, but no allocator was set.
-#
-# The nightly registers gdn_attention_core via direct_register_custom_op (Python,
-# not C++), so it works as a splitting_op for torch.compile.  We keep the original
-# torch.ops.vllm.gdn_attention_core() call intact — during tracing dynamo uses the
-# fake impl (no-op), and during eager execution the real impl calls _forward_core()
-# which now sets the Triton allocator.
+# 5. GDN Triton allocator fix for linear-attention layers
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -111,7 +255,6 @@ if MARKER in src:
     print("qwen3_next.py: GDN Triton allocator fix already applied, skipping.")
     sys.exit(0)
 
-# 1. Add allocator class after logger definition
 old_logger = 'logger = init_logger(__name__)\n\nKVCache = tuple[torch.Tensor, torch.Tensor]'
 new_logger = (
     'logger = init_logger(__name__)\n\n'
@@ -134,10 +277,6 @@ if old_logger not in src:
 
 src = src.replace(old_logger, new_logger, 1)
 
-# 2. Call triton.set_allocator() at start of _forward_core.
-#    The gdn_attention_core custom op is in splitting_ops, so _forward_core runs
-#    in eager mode (not compiled by dynamo).  triton.set_allocator uses ContextVar
-#    which is fine in eager mode.
 old_fcore = (
     '        """\n'
     '        Core attention computation (called by custom op).\n'
@@ -164,17 +303,7 @@ with open(path, "w") as f:
 print("Applied GDN Triton allocator fix to qwen3_next.py (custom op kept as splitting_op).")
 PYEOF
 
-# Fix: NVFP4 CUTLASS MoE kernel occasionally produces NaN values during prefill
-# when processing GDN-derived activations (specifically at layer 8 in the
-# Qwen3.5-122B-A10B-NVFP4 model).  Without a guard these NaN values propagate
-# through all subsequent layers, causing argmax(logits) == 0 ("!") for every
-# output token.
-#
-# Fix: add a torch.nan_to_num guard on the MoE FFN output inside
-# Qwen3NextDecoderLayer.forward(), but ONLY for linear_attention (GDN) layers.
-# full_attention layers (12/48) skip the guard entirely.
-# self.layer_type is a construction-time constant already branched on in
-# forward(), so torch.compile / dynamo handles it correctly (graph specialization).
+# 6. NaN guard for NVFP4 CUTLASS MoE kernel on GDN layers
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -216,8 +345,7 @@ with open(path, "w") as f:
 print("Applied NaN guard (GDN layers only) to Qwen3NextDecoderLayer.forward() in qwen3_next.py.")
 PYEOF
 
-# Fix: Qwen3NextMTP.remap_weight_names() — strip "language_model." prefix from VL model weights
-# so that embed_tokens / lm_head are found correctly during weight-sharing.
+# 7. MTP VL remap weight names (strip language_model. prefix)
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -262,8 +390,7 @@ with open(path, "w") as f:
 print("Patched qwen3_next_mtp.py: VL language_model prefix stripped in remap_weight_names.")
 PYEOF
 
-# Fix: @support_torch_compile on Qwen3NextMultiTokenPredictor — positions marked
-# dynamic on dim=-1, shape_invariants updated (no n==p check).
+# 8. MTP dynamic positions fix for MRoPE torch.compile compatibility
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -281,7 +408,7 @@ new = (
     MARKER + "\n"
     "# shape_invariants: links hidden_states token count to input_ids.\n"
     "# positions.shape[-1] is NOT linked to n because the full mrope buffer\n"
-    "# (shape (3, max_tokens+1)) is passed — larger than the actual token count.\n"
+    "# (shape (3, max_tokens+1)) is passed -- larger than the actual token count.\n"
     "def _qwen3_next_mtp_shape_invariants(\n"
     "    input_ids, positions, hidden_states,\n"
     "    intermediate_tensors=None, inputs_embeds=None, **kwargs\n"
@@ -312,12 +439,7 @@ with open(path, "w") as f:
 print("Patched qwen3_next_mtp.py: positions marked dynamic on dim=-1, shape_invariants updated.")
 PYEOF
 
-# Fix: Qwen3NextMultiTokenPredictor receives the shared NVFP4 quant_config, which
-# would apply ModelOptNvFp4LinearMethod to mtp.fc and all MTP sub-layers.
-# BUT the MTP checkpoint weights are plain BF16 (no pre-quantized NVFP4 tensors),
-# so the NVFP4 linear forward produces zeros/NaN.
-#
-# Fix: add "mtp." to quant_config.exclude_modules BEFORE any sub-layer is created.
+# 9. MTP quant exclusion fix (keep MTP layers in BF16, not NVFP4) - qwen3_next_mtp.py
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -343,14 +465,12 @@ new = (
     "        " + MARKER + "\n"
     "        # MTP checkpoint weights are plain BF16 (no pre-quantized NVFP4 tensors).\n"
     "        # Exclude all mtp.* layers from NVFP4 quantization so they run in BF16.\n"
-    "        # This must happen BEFORE any sub-layer is constructed so that\n"
-    "        # get_quant_method() sees the updated exclude_modules list.\n"
     "        if quant_config is not None and hasattr(quant_config, 'exclude_modules'):\n"
     "            if 'mtp.' not in quant_config.exclude_modules:\n"
     "                quant_config.exclude_modules.append('mtp.')\n"
     "                logger.info(\n"
     "                    'MTP: added mtp. to quant_config.exclude_modules '\n"
-    "                    '→ all MTP sub-layers will use unquantized BF16.')\n"
+    "                    '-> all MTP sub-layers will use unquantized BF16.')\n"
     "\n"
     "        config: Qwen3NextConfig = model_config.hf_config\n"
 )
@@ -365,9 +485,7 @@ with open(path, "w") as f:
 print("Patched qwen3_next_mtp.py: MTP layers excluded from NVFP4 quantization (BF16 path).")
 PYEOF
 
-# Fix: Same quant exclusion fix for qwen3_5_mtp.py (Qwen3_5MoeMTP class).
-# The nightly vLLM routes Qwen3.5-MoE MTP through qwen3_5_mtp.py, not qwen3_next_mtp.py.
-# Without this, BF16 MTP weights hit NVFP4 ColumnParallelLinear → shape mismatch → AssertionError.
+# 10. MTP quant exclusion fix - qwen3_5_mtp.py (Qwen3_5MoeMTP class)
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -393,14 +511,12 @@ new = (
     "        " + MARKER + "\n"
     "        # MTP checkpoint weights are plain BF16 (no pre-quantized NVFP4 tensors).\n"
     "        # Exclude all mtp.* layers from NVFP4 quantization so they run in BF16.\n"
-    "        # This must happen BEFORE any sub-layer is constructed so that\n"
-    "        # get_quant_method() sees the updated exclude_modules list.\n"
     "        if quant_config is not None and hasattr(quant_config, 'exclude_modules'):\n"
     "            if 'mtp.' not in quant_config.exclude_modules:\n"
     "                quant_config.exclude_modules.append('mtp.')\n"
     "                logger.info(\n"
     "                    'MTP: added mtp. to quant_config.exclude_modules '\n"
-    "                    '→ all MTP sub-layers will use unquantized BF16.')\n"
+    "                    '-> all MTP sub-layers will use unquantized BF16.')\n"
     "\n"
     "        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = model_config.hf_text_config\n"
 )
@@ -415,9 +531,7 @@ with open(path, "w") as f:
 print("Patched qwen3_5_mtp.py: MTP layers excluded from NVFP4 quantization (BF16 path).")
 PYEOF
 
-# Fix: MRotaryEmbedding.forward_native() — narrow 2D positions to query.shape[0]
-# BEFORE the cache lookup to avoid concrete shape propagation.
-# (nightly: local var `cos_sin_cache` instead of `self.cos_sin_cache`)
+# 11. MRotaryEmbedding forward_native() -- narrow positions to query.shape[0]
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -454,9 +568,7 @@ with open(path, "w") as f:
 print("Patched mrope.py: positions narrowed to query.shape[0] before cache lookup.")
 PYEOF
 
-# Fix: eagle.py _get_positions() — return mrope_positions[:, :max_num_tokens]
-# (fixed-size buffer) so compiled assert_size_stride always passes.
-# (nightly: xdrope branch added between mrope and default return)
+# 12. Eagle _get_positions() -- return full mrope buffer for compiled compatibility
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -481,10 +593,8 @@ new = (
     "    def _get_positions(self, num_tokens: int):\n"
     "        " + MARKER + "\n"
     "        # For MRoPE, always return the max-size slice mrope_positions[:, :max_num_tokens]\n"
-    "        # (non-contiguous, shape (3, max_num_tokens)) regardless of num_tokens.\n"
-    "        # The compiled eagle_head's assert_size_stride(positions, (s80, max_num_tokens), ...)\n"
-    "        # always passes. mrope.py narrows positions[:, :query.shape[0]] (dynamic)\n"
-    "        # so cos/sin are computed only for the actual N tokens in the batch.\n"
+    "        # so compiled eagle_head's assert_size_stride always passes.\n"
+    "        # mrope.py narrows positions[:, :query.shape[0]] dynamically.\n"
     "        if self.uses_mrope:\n"
     "            return self.mrope_positions[:, :self.max_num_tokens]\n"
     "        if self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:\n"
@@ -502,8 +612,7 @@ with open(path, "w") as f:
 print("Patched eagle.py: _get_positions() returns mrope_positions[:, :max_num_tokens] for MRoPE.")
 PYEOF
 
-# Fix: SpecDecodingProm.observe() can receive negative num_accepted_tokens.
-# Guard all counter increments with max(0, value).
+# 13. SpecDecoding metrics -- guard against negative counter values
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -538,8 +647,7 @@ new = (
     "    def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):\n"
     "        " + MARKER + "\n"
     "        # Guard all counter increments with max(0, value) to prevent\n"
-    "        # ValueError when num_accepted_tokens is negative (e.g. when\n"
-    "        # len(generated_token_ids)==0 due to request abort or early EOS).\n"
+    "        # ValueError when num_accepted_tokens is negative.\n"
     "        if not self.spec_decoding_enabled:\n"
     "            return\n"
     "        self.counter_spec_decode_num_drafts[engine_idx].inc(\n"
@@ -564,21 +672,10 @@ if old not in src:
 src = src.replace(old, new, 1)
 with open(path, "w") as f:
     f.write(src)
-print("Patched spec_decode/metrics.py: negative counter guard added to SpecDecodingProm.observe().")
+print("Patched spec_decode/metrics.py: negative counter guard added.")
 PYEOF
 
-# Fix: flashinfer autotuner re-profiles all GEMM tactics on every startup because
-# profiling_cache is in-memory only.  On SM12x, the TRT-LLM CUTLASS tactic fails
-# 1,500+ times per startup (Ninja build failure for delayStream.cu).
-#
-# Two-part fix:
-# 1. Patch autotuner.py: redirect get_config_path to the flashinfer cache volume
-#    (/root/.cache/flashinfer/tuning_configs/) so results survive container recreation.
-#    Patch load_from_file to use exec() for file-based loading (no importlib needed).
-# 2. Patch kernel_warmup.py: dump profiling_cache after autotuning completes.
-#    With FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1, subsequent starts load from file.
-
-# Part 1: Patch autotuner.py — config path + file loader
+# 14. FlashInfer autotuner -- config path to cache volume + exec()-based loader
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -591,7 +688,6 @@ if MARKER in src:
     print("autotuner.py: config path fix already applied, skipping.")
     sys.exit(0)
 
-# 1a. Patch get_config_path to use cache volume
 old_gcp = (
     'def get_config_path(is_module: bool):\n'
     '    dev_name = torch.cuda.get_device_name(0).replace(" ", "_")\n'
@@ -627,7 +723,6 @@ if old_gcp not in src:
 
 src = src.replace(old_gcp, new_gcp, 1)
 
-# 1b. Patch load_from_file to use exec() instead of importlib.import_module
 old_lff = (
     '@lru_cache(maxsize=None)\n'
     'def load_from_file(key):\n'
@@ -679,10 +774,10 @@ src = src.replace(old_lff, new_lff, 1)
 
 with open(path, "w") as f:
     f.write(src)
-print("Patched autotuner.py: config path → cache volume, load_from_file → exec()-based.")
+print("Patched autotuner.py: config path -> cache volume, load_from_file -> exec()-based.")
 PYEOF
 
-# Part 2: Patch kernel_warmup.py — dump profiling_cache after autotune
+# 15. kernel_warmup.py -- dump profiling_cache after FlashInfer autotune
 RUN python3 - <<'PYEOF'
 import sys
 
@@ -780,3 +875,5 @@ with open(path, "w") as f:
     f.write(src)
 print("Patched kernel_warmup.py: autotune results dump to cache volume after warmup.")
 PYEOF
+
+EXPOSE 8000

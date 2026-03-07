@@ -4,7 +4,7 @@
 
 [txn545/Qwen3.5-122B-A10B-NVFP4](https://huggingface.co/txn545/Qwen3.5-122B-A10B-NVFP4)를 **NVIDIA DGX Spark (GB10 / SM121)** 에서 vLLM으로 서빙합니다.
 
-이 이미지는 `vllm-mxfp4-spark:latest`(SM121 최적화 vLLM 빌드, NVFP4 + FlashInfer-CUTLASS 지원)를 기반으로 하며, Qwen3.5 VL MoE 아키텍처 서빙에 필요한 커스텀 모델 클래스를 추가합니다.
+외부 사전 빌드 이미지 없이 FlashInfer를 SM121용으로 소스 컴파일하고, vLLM nightly를 설치하며, Qwen3.5 VL MoE 아키텍처 서빙에 필요한 모든 NVFP4 패치를 적용하는 자체 완결형(self-contained) 멀티 스테이지 Docker 빌드입니다.
 
 ---
 
@@ -32,7 +32,7 @@
 |---|---|
 | NVIDIA DGX Spark (GB10) | SM12x GPU 필요 |
 | NVIDIA Container Toolkit | `nvidia-ctk`, GPU 지원 `docker` |
-| 베이스 이미지 `vllm-mxfp4-spark:latest` | [spark-vllm-docker](https://github.com/JungkwanBan/spark-vllm-docker)에서 `--exp-mxfp4` 옵션으로 빌드 |
+| Docker Buildx | 멀티 스테이지 빌드의 캐시 마운트에 필요 |
 | Docker Compose v2 | `docker compose` (`docker-compose` 아님) |
 | 외부 Docker 네트워크 `monitoring` | `docker network create monitoring` |
 | 모델 가중치 | [Hugging Face](https://huggingface.co/txn545/Qwen3.5-122B-A10B-NVFP4)에서 다운로드 |
@@ -220,7 +220,7 @@ DGX Spark (SM121)에서 두 FlashInfer MoE 경로 모두 실패합니다:
 - **기반 모델** – [Qwen/Qwen3.5-122B-A10B-Instruct](https://huggingface.co/Qwen/Qwen3.5-122B-A10B-Instruct) — Qwen Team, Alibaba Cloud
 - **양자화 도구** – [llm-compressor](https://github.com/vllm-project/llm-compressor) (SparseML / Neural Magic)
 - **vLLM** – [vllm-project/vllm](https://github.com/vllm-project/vllm)
-- **베이스 Docker 이미지** – `vllm-mxfp4-spark:latest` — SM121/GB10 최적화 vLLM 빌드, NVFP4 + FlashInfer-CUTLASS ([spark-vllm-docker](https://github.com/JungkwanBan/spark-vllm-docker))
+- **베이스 Docker 이미지** – `nvcr.io/nvidia/pytorch:26.01-py3` (NVIDIA NGC PyTorch)
 - **FlashInfer** – [flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer)
 - **Qwen3Next / GDN 아키텍처** – [`vllm/model_executor/models/qwen3_next.py`](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_next.py) (vLLM)
 - **compressed-tensors** – [neuralmagic/compressed-tensors](https://github.com/neuralmagic/compressed-tensors)

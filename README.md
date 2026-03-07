@@ -4,7 +4,7 @@
 
 Run [txn545/Qwen3.5-122B-A10B-NVFP4](https://huggingface.co/txn545/Qwen3.5-122B-A10B-NVFP4) with vLLM on **NVIDIA DGX Spark (GB10 / SM121)**.
 
-This image extends `vllm-mxfp4-spark:latest` — a SM121-optimised vLLM build with NVFP4 + FlashInfer-CUTLASS support — and adds the custom model class required to serve the Qwen3.5 VL MoE architecture.
+Self-contained multi-stage Docker build that compiles FlashInfer from source for SM121, installs vLLM nightly, and applies all NVFP4-specific patches required to serve the Qwen3.5 VL MoE architecture. No external pre-built base image required.
 
 ---
 
@@ -32,7 +32,7 @@ This image extends `vllm-mxfp4-spark:latest` — a SM121-optimised vLLM build wi
 |---|---|
 | NVIDIA DGX Spark (GB10) | SM12x GPU required |
 | NVIDIA Container Toolkit | `nvidia-ctk`, `docker` with GPU support |
-| Base image `vllm-mxfp4-spark:latest` | Build from [spark-vllm-docker](https://github.com/JungkwanBan/spark-vllm-docker) with `--exp-mxfp4` |
+| Docker Buildx | Required for multi-stage build with cache mounts |
 | Docker Compose v2 | `docker compose` (not `docker-compose`) |
 | External Docker network `monitoring` | `docker network create monitoring` |
 | Model weights | Download from [Hugging Face](https://huggingface.co/txn545/Qwen3.5-122B-A10B-NVFP4) |
@@ -220,7 +220,7 @@ Metric: total completion_tokens (thinking + content) / wall time
 - **Base model** – [Qwen/Qwen3.5-122B-A10B-Instruct](https://huggingface.co/Qwen/Qwen3.5-122B-A10B-Instruct) — Qwen Team, Alibaba Cloud
 - **Quantization tool** – [llm-compressor](https://github.com/vllm-project/llm-compressor) (SparseML / Neural Magic)
 - **vLLM** – [vllm-project/vllm](https://github.com/vllm-project/vllm)
-- **Base Docker image** – `vllm-mxfp4-spark:latest` — SM121/GB10-optimised vLLM build with NVFP4 + FlashInfer-CUTLASS ([spark-vllm-docker](https://github.com/JungkwanBan/spark-vllm-docker))
+- **Base Docker image** – `nvcr.io/nvidia/pytorch:26.01-py3` (NVIDIA NGC PyTorch)
 - **FlashInfer** – [flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer)
 - **Qwen3Next / GDN architecture** – [`vllm/model_executor/models/qwen3_next.py`](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_next.py) in vLLM
 - **compressed-tensors** – [neuralmagic/compressed-tensors](https://github.com/neuralmagic/compressed-tensors)
