@@ -165,7 +165,7 @@ RUN --mount=type=bind,from=flashinfer-builder,source=/workspace/wheels,target=/m
     uv pip install /mount/wheels/*.whl
 
 # ---- Install vLLM nightly (cu130 / aarch64) ----
-ARG VLLM_VERSION="vllm==0.16.1rc1.dev75+ge3691988d.cu130"
+ARG VLLM_VERSION="vllm==0.17.0rc1.dev216+ga3189a08b.cu130"
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     pip install "${VLLM_VERSION}" \
       --index-url https://wheels.vllm.ai/nightly/cu130 \
@@ -175,11 +175,17 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
       --quiet
 
 # ---- Runtime dependencies ----
+# Install vLLM deps automatically, excluding torch/torchvision/torchaudio (NGC provides these)
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv pip install \
+    DEPS=$(pip show vllm 2>/dev/null | grep ^Requires | sed 's/Requires: //' | tr ',' '\n' | \
+      sed 's/^ *//;s/ *$//' | grep -v -E '^(torch|torchvision|torchaudio|flashinfer)' | \
+      tr '\n' ' ') && \
+    echo "Installing vLLM deps: $DEPS" && \
+    uv pip install $DEPS \
       ray[default] \
       fastsafetensors \
-      nvidia-nvshmem-cu13
+      nvidia-nvshmem-cu13 \
+      uvloop
 
 # ---- Qwen3.5 MoE compatibility ----
 ARG TRANSFORMERS_VER=5.2.0
@@ -203,6 +209,30 @@ RUN python3 /tmp/qwen3_5_moe_rope_fix.py
 
 # Remove incompatible triton-kernels if present
 RUN uv pip uninstall triton-kernels 2>/dev/null || true
+
+# 2b. AOT compile cache serialization fix (torch.fx.Node pickling)
+COPY patches/aot_cache_fix.patch /tmp/
+RUN cd / && \
+    (patch -p1 --dry-run < /tmp/aot_cache_fix.patch &>/dev/null && \
+     patch -p1 < /tmp/aot_cache_fix.patch && \
+     echo "Applied AOT cache fix patch." || \
+     echo "AOT cache fix patch not applicable, skipping.")
+
+# 2c. Force nogds=True for GB10 (no GDS support)
+COPY patches/nogds_force.patch /tmp/
+RUN cd / && \
+    (patch -p1 --dry-run < /tmp/nogds_force.patch &>/dev/null && \
+     patch -p1 < /tmp/nogds_force.patch && \
+     echo "Applied nogds force patch." || \
+     echo "nogds force patch not applicable, skipping.")
+
+# 2d. GB10 MoE tuning configs (E=256,N=512 and E=512,N=512)
+COPY patches/moe_config_e256.json /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/configs/E=256,N=512,device_name=NVIDIA_GB10,dtype=fp8_w8a8,block_shape=[128,128].json
+COPY patches/moe_config_e512.json /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/configs/E=512,N=512,device_name=NVIDIA_GB10,dtype=fp8_w8a8,block_shape=[128,128].json
+
+# 2e. SM121 compatibility patches (is_blackwell_class, nvfp4 split, TRITON_PTXAS)
+COPY patches/apply_sm121_patches.py /tmp/
+RUN python3 /tmp/apply_sm121_patches.py
 
 # ---- NVFP4-specific patches ----
 
@@ -866,8 +896,8 @@ new = (
 )
 
 if old not in src:
-    print("ERROR: flashinfer_autotune anchor not found in kernel_warmup.py", file=sys.stderr)
-    sys.exit(1)
+    print("WARNING: flashinfer_autotune anchor not found in kernel_warmup.py (API changed in new vLLM), skipping.", file=sys.stderr)
+    sys.exit(0)
 
 src = src.replace(old, new, 1)
 
