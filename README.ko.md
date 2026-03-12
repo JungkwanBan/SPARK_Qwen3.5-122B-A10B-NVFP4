@@ -1,5 +1,8 @@
 # vLLM – Qwen3.5-122B-A10B-NVFP4 on DGX Spark
 
+> **이 리포지토리는 [spark_vllm_docker](https://github.com/JungkwanBan/spark_vllm_docker)로 통합되었습니다.**
+> 향후 업데이트는 통합 리포지토리에서 진행됩니다.
+
 [English](README.md) | **한국어**
 
 [txn545/Qwen3.5-122B-A10B-NVFP4](https://huggingface.co/txn545/Qwen3.5-122B-A10B-NVFP4)를 **NVIDIA DGX Spark (GB10 / SM121)** 에서 vLLM으로 서빙합니다.
